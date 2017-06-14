@@ -1,7 +1,7 @@
 #include "darknet.h"
 
 static int coco_ids[] = {1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19,20,21,22,23,24,25,27,28,31,32,33,34,35,36,37,38,39,40,41,42,43,44,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,67,70,72,73,74,75,76,77,78,79,80,81,82,84,85,86,87,88,89,90};
-
+int step = 1;
 void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, int ngpus, int clear)
 {
     list *options = read_data_cfg(datacfg);
@@ -22,7 +22,12 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
 #ifdef GPU
         cuda_set_device(gpus[i]);
 #endif
-        nets[i] = load_network(cfgfile, weightfile, clear);
+        nets[i] = parse_network_cfg(cfgfile);
+        if(weightfile){
+            load_weights(&nets[i], weightfile);
+        }
+        if(clear) *nets[i].seen = 0;
+        nets[i].learning_rate *= ngpus;
     }
     srand(time(0));
     network net = nets[0];
@@ -154,7 +159,6 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     sprintf(buff, "%s/%s_final.weights", backup_directory, base);
     save_weights(net, buff);
 }
-
 
 static int get_coco_image_id(char *filename)
 {
@@ -605,10 +609,6 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
         }
         image im = load_image_color(input,0,0);
         image sized = letterbox_image(im, net.w, net.h);
-        //image sized = resize_image(im, net.w, net.h);
-        //image sized2 = resize_max(im, net.w);
-        //image sized = crop_image(sized2, -((net.w - sized2.w)/2), -((net.h - sized2.h)/2), net.w, net.h);
-        //resize_network(&net, sized.w, sized.h);
         layer l = net.layers[net.n-1];
 
         box *boxes = calloc(l.w*l.h*l.n, sizeof(box));
@@ -620,8 +620,8 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
         network_predict(net, X);
         printf("%s: Predicted in %f seconds.\n", input, sec(clock()-time));
         get_region_boxes(l, im.w, im.h, net.w, net.h, thresh, probs, boxes, 0, 0, hier_thresh, 1);
+      
         if (nms) do_nms_obj(boxes, probs, l.w*l.h*l.n, l.classes, nms);
-        //else if (nms) do_nms_sort(boxes, probs, l.w*l.h*l.n, l.classes, nms);
         draw_detections(im, l.w*l.h*l.n, thresh, boxes, probs, names, alphabet, l.classes);
         if(outfile){
             save_image(im, outfile);
@@ -646,12 +646,120 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
         if (filename) break;
     }
 }
+char getStringFrom(FILE *f, char end, char *buffer){
+    int c, i=0;
+    memset(buffer,0,strlen(buffer));
 
+    while ((c=getc(f)) != EOF) {
+        if (c == EOF)
+            return c;
+        if (c==end){
+            buffer[i] = '\0';
+            return 'a';
+        }   
+        buffer[i]=c;
+        i++;
+        
+    }
+	return EOF;
+}
+void each_image(char *datacfg, char *weightfile, char *weight_related,char *cfg, char *cfg_related){
+    list *options = read_data_cfg(datacfg);
+    char *name_list = option_find_str(options, "names", "data/names.list");
+    char **names = get_labels(name_list);
+    image **alphabet = load_alphabet();
+    network net = parse_network_cfg(cfg);
+    if(weightfile){
+        load_weights(&net, weightfile);
+    }
+    set_batch_network(&net, 1);
+    srand(2222222);
+    clock_t time;
+
+    int j;
+    float nms=.4;
+    FILE *file = fopen("images.txt","r");
+    char buffer[220];
+    char buff[256];
+    char *input = buff;
+    int c,i =0;
+    while (getStringFrom(file, '\n', buffer) != EOF) {
+        strncpy(input, buffer, 256);
+	if(!strlen(buffer))
+		continue;
+
+
+
+
+        image im = load_image_color(input,0,0);
+        image sized = letterbox_image(im, net.w, net.h);
+        layer l = net.layers[net.n-1];
+        printf("        Predicting  %s.\n", input);
+        box *boxes = calloc(l.w*l.h*l.n, sizeof(box));
+        float **probs = calloc(l.w*l.h*l.n, sizeof(float *));
+        for(j = 0; j < l.w*l.h*l.n; ++j) probs[j] = calloc(l.classes + 1, sizeof(float *));
+        float *X = sized.data;
+        time=clock();
+        network_predict(net, X);
+        printf("        %s: Predicted in %f seconds.\n", input, sec(clock()-time));
+        get_region_boxes(l, im.w, im.h, net.w, net.h, 0.24, probs, boxes, 0, 0, 0.5, 1);
+        if (nms) do_nms_obj(boxes, probs, l.w*l.h*l.n, l.classes, nms);
+        char temp_name[100];
+        sprintf(temp_name, "results/%d-%s-%s", step, cfg_related, weight_related);
+        printf("%s\n",temp_name );
+        draw_detections_name(im, l.w*l.h*l.n, .24, boxes, probs, names, alphabet, l.classes, temp_name);
+
+        save_image(im, temp_name);
+        step++;
+        free_image(im);
+        free_image(sized);
+        free(boxes);
+        free_ptrs((void **)probs, l.w*l.h*l.n);
+    }
+    free_network(net);
+    free_list(options);
+}
+
+void each_cfg (char *datacfg,char *weight_name, char *weight_related){
+    FILE *file = fopen("cfg.txt","r");
+    char buffer[220];
+    memset(buffer,0,strlen(buffer));
+
+    while (getStringFrom(file, ' ', buffer) != EOF) {
+           char name[10];
+           getStringFrom(file, '\n', name);
+           printf("    name related with cfg \"%s\"\n", name);
+
+           printf("    Loading cfg \"%s\"\n", buffer);
+           step = 0;
+           each_image(datacfg,weight_name,weight_related, buffer,name);
+           memset(buffer,0,strlen(buffer));
+
+    }
+
+}
+static void each_weight (char *datacfg)  {
+    FILE *file = fopen("weights.txt","r");
+    char buffer[220];
+    
+    memset(buffer,0,strlen(buffer));
+
+    while (getStringFrom(file, ' ', buffer) != EOF) {
+           char name[10];
+           getStringFrom(file, '\n', name);
+           printf("name related with weights \"%s\"\n", name);
+           printf("Loading weights \"%s\"\n", buffer);
+           each_cfg(datacfg, buffer, name);
+           memset(buffer,0,strlen(buffer));
+
+    }
+}
 void run_detector(int argc, char **argv)
 {
     char *prefix = find_char_arg(argc, argv, "-prefix", 0);
     float thresh = find_float_arg(argc, argv, "-thresh", .24);
     float hier_thresh = find_float_arg(argc, argv, "-hier", .5);
+    printf("%f\n", hier_thresh);
     int cam_index = find_int_arg(argc, argv, "-c", 0);
     int frame_skip = find_int_arg(argc, argv, "-s", 0);
     int avg = find_int_arg(argc, argv, "-avg", 3);
@@ -698,6 +806,8 @@ void run_detector(int argc, char **argv)
     else if(0==strcmp(argv[2], "valid")) validate_detector(datacfg, cfg, weights, outfile);
     else if(0==strcmp(argv[2], "valid2")) validate_detector_flip(datacfg, cfg, weights, outfile);
     else if(0==strcmp(argv[2], "recall")) validate_detector_recall(cfg, weights);
+    else if(0==strcmp(argv[2], "try")) each_weight(datacfg);
+
     else if(0==strcmp(argv[2], "demo")) {
         list *options = read_data_cfg(datacfg);
         int classes = option_find_int(options, "classes", 20);
